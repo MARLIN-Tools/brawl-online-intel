@@ -1,0 +1,150 @@
+name: Brawl Online for Intel Macs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Brawl Online version (empty: the newest)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: brawl-online-intel
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - id: v
+        env:
+          WANT: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          v="$WANT"
+          if [ -z "$v" ]; then
+            v="$(curl -fsSL -A brawl-online-intel https://brawlonline.net/updates/launcher/latest-mac.yml | awk '$1 == "version:" { print $2; exit }')"
+          fi
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::no version ($v)"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && gh release view "v$v" -R "$REPO" > /dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Brawl Online $v for Intel Macs is already built"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  intel:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15-intel
+    timeout-minutes: 300
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      CCACHE_MAXSIZE: 2G
+    steps:
+      - name: Official app
+        run: |
+          [ "$(uname -m)" = x86_64 ] || { echo "::error::not an Intel Mac"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/official"
+          curl -fL -A brawl-online-intel -o "$RUNNER_TEMP/official.zip" \
+            "https://brawlonline.net/updates/launcher/Brawl-Online-$VERSION-arm64-mac.zip"
+          ditto -x -k "$RUNNER_TEMP/official.zip" "$RUNNER_TEMP/official"
+          plist="$RUNNER_TEMP/official/Brawl Online.app/Contents/Resources/dolphin/Dolphin.app/Contents/Info.plist"
+          commit="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleLongVersionString' "$plist")"
+          short="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no source commit in Dolphin's Info.plist ($commit)"; exit 1; }
+          [ "$short" = "v$VERSION" ] || echo "::warning::Dolphin says $short, the app is $VERSION"
+          echo "COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "Brawl Online $VERSION, Dolphin source sarahkittyy/brawlonline.net@$commit"
+      - uses: actions/checkout@v4
+        with:
+          repository: sarahkittyy/brawlonline.net
+          ref: ${{ env.COMMIT }}
+          path: client
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: self
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build tools
+        run: brew install ninja ccache
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/ci-cache/ccache
+            ~/ci-cache/qt
+          key: intel-dolphin-${{ github.run_id }}
+          restore-keys: intel-dolphin-
+      - name: Stamp version
+        run: client/.github/scripts/stamp-version.sh "$VERSION"
+      - name: Dolphin for Intel
+        run: client/.github/scripts/build-dolphin-macos.sh "$VERSION" "$RUNNER_TEMP/dolphin" x86_64
+      - name: Convert the app
+        run: |
+          python3 self/intel_swap.py "$RUNNER_TEMP/official/Brawl Online.app" "$RUNNER_TEMP/dolphin" \
+            client/launcher/assets/entitlements.mac.plist "$RUNNER_TEMP/swap"
+      - name: Zip
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cd "$RUNNER_TEMP/official"
+          ditto -c -k --sequesterRsrc --keepParent "Brawl Online.app" "$RUNNER_TEMP/out/Brawl-Online-$VERSION-Intel-Mac.zip"
+          ls -l "$RUNNER_TEMP/out"
+      - name: "Test: dolphin-tool starts"
+        run: |
+          tool="$RUNNER_TEMP/official/Brawl Online.app/Contents/Resources/dolphin/Dolphin.app/Contents/MacOS/dolphin-tool"
+          set +e; "$tool" > "$RUNNER_TEMP/tool.log" 2>&1; rc=$?; set -e
+          head -n 20 "$RUNNER_TEMP/tool.log"
+          [ "$rc" -lt 128 ] || { echo "::error::dolphin-tool crashed (exit $rc)"; exit 1; }
+      - name: "Test: Dolphin and the launcher stay up for 20 s"
+        run: |
+          app="$RUNNER_TEMP/official/Brawl Online.app"
+          stay_up() {
+            local name="$1"; shift
+            "$@" > "$RUNNER_TEMP/$name.log" 2>&1 &
+            local pid=$!
+            sleep 20
+            if kill -0 "$pid" 2>/dev/null; then
+              echo "$name: still running after 20 s"
+              kill "$pid"; wait "$pid" 2>/dev/null || true
+              pkill -f "$app" 2>/dev/null || true
+              return 0
+            fi
+            wait "$pid"; local rc=$?
+            echo "::error::$name exited within 20 s (exit $rc)"
+            tail -n 40 "$RUNNER_TEMP/$name.log"
+            return 1
+          }
+          ok=0
+          stay_up dolphin "$app/Contents/Resources/dolphin/Dolphin.app/Contents/MacOS/Dolphin" -u "$RUNNER_TEMP/dolphin-user" || ok=1
+          stay_up launcher "$app/Contents/MacOS/Brawl Online" || ok=1
+          ls -t ~/Library/Logs/DiagnosticReports 2>/dev/null | grep -i -E 'dolphin|brawl' | head -n 2 |
+            while IFS= read -r r; do
+              echo "--- crash report $r"; head -n 60 ~/Library/Logs/DiagnosticReports/"$r"
+            done
+          exit $ok
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip="$RUNNER_TEMP/out/Brawl-Online-$VERSION-Intel-Mac.zip"
+          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "v$VERSION" "$zip" --clobber -R "$GITHUB_REPOSITORY"
+          else
+            newest="$( { gh release list -R "$GITHUB_REPOSITORY" -L 1000 --json tagName -q '.[].tagName'; echo "v$VERSION"; } | sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+            latest=false
+            [ "$newest" = "$VERSION" ] && latest=true
+            gh release create "v$VERSION" "$zip" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest="$latest" --title "brawl online $VERSION for intel macs" --notes "brawl online $VERSION for intel macs"
+          fi
